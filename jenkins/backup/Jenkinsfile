@@ -1,0 +1,106 @@
+// Backs up Azure SQL (MSSQL) and Azure Database for PostgreSQL to a LOCAL
+// directory on the Jenkins agent. No Azure Blob Storage upload is performed.
+//
+// Build parameters are exposed to the shell scripts as environment variables.
+pipeline {
+    agent {
+        label 'azure-backup'
+    }
+
+    options {
+        disableConcurrentBuilds()
+        timeout(time: 6, unit: 'HOURS')
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+    }
+
+    triggers {
+        cron('H 2 * * *')
+    }
+
+    parameters {
+        booleanParam(name: 'BACKUP_MSSQL', defaultValue: true,
+                     description: 'Export the Azure SQL database to a local .bacpac file')
+        booleanParam(name: 'BACKUP_POSTGRES', defaultValue: true,
+                     description: 'Dump the Azure PostgreSQL database to a local .dump file')
+        string(name: 'BACKUP_ROOT', defaultValue: '/var/backups/databases',
+               description: 'Local directory on the agent where backups are stored')
+        string(name: 'RETENTION_DAYS', defaultValue: '14',
+               description: 'Delete local backups older than this many days (0 disables cleanup)')
+        string(name: 'MSSQL_SERVER', defaultValue: '',
+               description: 'e.g. myserver.database.windows.net')
+        string(name: 'MSSQL_DATABASE', defaultValue: '',
+               description: 'Azure SQL database name')
+        string(name: 'PG_HOST', defaultValue: '',
+               description: 'e.g. myserver.postgres.database.azure.com')
+        string(name: 'PG_DATABASE', defaultValue: '',
+               description: 'PostgreSQL database name')
+    }
+
+    environment {
+        // Shared by every stage so all files from one run share a timestamp.
+        BACKUP_STAMP = sh(script: 'date -u +%Y%m%dT%H%M%SZ', returnStdout: true).trim()
+    }
+
+    stages {
+        stage('Prepare') {
+            steps {
+                script {
+                    if (!params.BACKUP_MSSQL && !params.BACKUP_POSTGRES) {
+                        error('Nothing to do: enable BACKUP_MSSQL and/or BACKUP_POSTGRES.')
+                    }
+                    env.BACKUP_DIR = "${params.BACKUP_ROOT}/${env.BACKUP_STAMP}-${env.BUILD_NUMBER}"
+                }
+                sh '''
+                    set -eu
+                    mkdir -p "${BACKUP_DIR}"
+                    echo "Backups for this run will be written to ${BACKUP_DIR}"
+                    df -h "${BACKUP_DIR}"
+                '''
+            }
+        }
+
+        stage('Backup MSSQL') {
+            when { expression { return params.BACKUP_MSSQL } }
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'azure-mssql-backup-login',
+                                                  usernameVariable: 'MSSQL_USER',
+                                                  passwordVariable: 'MSSQL_PASSWORD')]) {
+                    sh './jenkins/scripts/backup-mssql.sh'
+                }
+            }
+        }
+
+        stage('Backup PostgreSQL') {
+            when { expression { return params.BACKUP_POSTGRES } }
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'azure-postgres-backup-login',
+                                                  usernameVariable: 'PG_USER',
+                                                  passwordVariable: 'PGPASSWORD')]) {
+                    sh './jenkins/scripts/backup-postgres.sh'
+                }
+            }
+        }
+
+        stage('Summarise') {
+            steps {
+                sh '''
+                    set -eu
+                    echo "Local backups produced by build ${BUILD_NUMBER}:"
+                    ls -lh "${BACKUP_DIR}"
+                '''
+            }
+        }
+
+        stage('Cleanup old backups') {
+            steps {
+                sh './jenkins/scripts/cleanup-local-backups.sh'
+            }
+        }
+    }
+
+    post {
+        failure {
+            echo "Backup failed. Inspect ${env.BACKUP_DIR} on agent ${env.NODE_NAME} before retrying."
+        }
+    }
+}
